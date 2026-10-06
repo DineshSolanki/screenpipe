@@ -1,7 +1,7 @@
 # screenpipe — AI that knows everything you've seen, said, or heard
 # https://screenpi.pe
 
-name: Build Linux source app
+name: Build source apps
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       - "source-build/**"
 
 concurrency:
-  group: build-linux-source-${{ github.ref }}
+  group: build-source-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -208,5 +208,160 @@ jobs:
           path: |
             apps/screenpipe-app-tauri/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
             apps/screenpipe-app-tauri/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  build-windows:
+    name: Build Windows NSIS installer
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: C:\t
+      GIT_LFS_SKIP_SMUDGE: "1"
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.10"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            apps/screenpipe-app-tauri/src-tauri
+          shared-key: windows-source-x86_64-pc-windows-msvc
+          cache-bin: false
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install LLVM and 7-Zip
+        shell: pwsh
+        run: |
+          choco install llvm 7zip.install --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Failed to install LLVM or 7-Zip" }
+          if (-not (Test-Path "$env:LIBCLANG_PATH\libclang.dll")) {
+            throw "libclang.dll not found at $env:LIBCLANG_PATH"
+          }
+          "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Shorten Cargo target path
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath $env:CARGO_TARGET_DIR)) {
+            New-Item -ItemType Directory -Path $env:CARGO_TARGET_DIR | Out-Null
+          }
+          $target = "apps\screenpipe-app-tauri\src-tauri\target"
+          if (Test-Path -LiteralPath $target) {
+            Remove-Item -LiteralPath $target -Recurse -Force
+          }
+          cmd /c mklink /J $target $env:CARGO_TARGET_DIR
+          if ($LASTEXITCODE -ne 0) { throw "Failed to create short Cargo target junction" }
+
+      - name: Install Windows frontend dependencies
+        uses: ./.github/actions/install-windows-frontend-dependencies
+
+      - name: Configure source build without updater signing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item apps/screenpipe-app-tauri/src-tauri/tauri.prod.conf.json `
+            apps/screenpipe-app-tauri/src-tauri/tauri.conf.json -Force
+          $configPath = "apps/screenpipe-app-tauri/src-tauri/tauri.conf.json"
+          $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+          $config.build.beforeBuildCommand = "bun run build"
+          $config.bundle.createUpdaterArtifacts = $false
+          $config.bundle.windows.PSObject.Properties.Remove("signCommand")
+          $config.plugins.updater.active = $false
+          $config | ConvertTo-Json -Depth 100 |
+            Set-Content -LiteralPath $configPath -Encoding utf8
+
+      - name: Download ONNX Runtime and DirectML
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '1.24.2'
+          $directMlVersion = '1.15.4'
+          Invoke-WebRequest `
+            -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/$version" `
+            -OutFile ort-dml.zip
+          Invoke-WebRequest `
+            -Uri "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/$directMlVersion" `
+            -OutFile directml.zip
+          7z x ort-dml.zip -oort-dml -y
+          if ($LASTEXITCODE -ne 0) { throw "Failed to extract ONNX Runtime package" }
+          7z x directml.zip -odirectml -y
+          if ($LASTEXITCODE -ne 0) { throw "Failed to extract DirectML package" }
+
+          $libDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-$version/lib"
+          New-Item -ItemType Directory -Force -Path $libDir | Out-Null
+          Copy-Item ort-dml/runtimes/win-x64/native/onnxruntime.dll $libDir
+          Copy-Item ort-dml/runtimes/win-x64/native/onnxruntime.lib $libDir
+          Copy-Item directml/bin/x64-win/DirectML.dll $libDir
+          $resolvedLibDir = (Resolve-Path $libDir).Path
+          "ORT_STRATEGY=system" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ORT_LIB_LOCATION=$resolvedLibDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $resolvedLibDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+          ./.github/scripts/setup-vulkan-windows.ps1 `
+            -Architecture x64 `
+            -StageRuntimeDirectory $libDir
+          if ($LASTEXITCODE -ne 0) { throw "Failed to stage Vulkan runtime" }
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          ./.github/scripts/setup-vulkan-windows.ps1 -Architecture x64 -InstallSdk
+          if ($LASTEXITCODE -ne 0) { throw "Failed to install Vulkan SDK" }
+
+      - name: Configure Ninja
+        shell: pwsh
+        run: ./.github/scripts/setup-ninja-windows.ps1
+
+      - name: Prepare native app dependencies
+        working-directory: apps/screenpipe-app-tauri
+        env:
+          CI: "true"
+          SKIP_SCREENPIPE_SETUP: "true"
+          SCREENPIPE_RELEASE_TARGET: x86_64-pc-windows-msvc
+        run: bun ./scripts/pre_build.js
+
+      - name: Build source app
+        working-directory: apps/screenpipe-app-tauri
+        shell: pwsh
+        env:
+          CI: "true"
+          CMAKE_ARGS: -DGGML_NATIVE=OFF
+          GGML_NATIVE: "OFF"
+          SCREENPIPE_RELEASE_TARGET: x86_64-pc-windows-msvc
+        run: |
+          bunx tauri build --verbose `
+            --target x86_64-pc-windows-msvc `
+            --config src-tauri/tauri.windows.conf.json `
+            --features directml,vulkan,redact-onnx-directml
+          if ($LASTEXITCODE -ne 0) { throw "Windows source build failed: $LASTEXITCODE" }
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenpipe-windows-x86_64
+          path: apps/screenpipe-app-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
           if-no-files-found: error
           retention-days: 14
